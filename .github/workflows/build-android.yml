@@ -1,0 +1,144 @@
+name: Build Playlyna APK
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: npm install
+        run: npm install
+
+      - name: cap add android
+        run: npx cap add android
+
+      - name: cap sync
+        run: npx cap sync android
+
+      - name: Copy playlyna-player module
+        run: cp -r playlyna-player android/playlyna-player
+
+      - name: Include module in settings.gradle
+        run: |
+          SETTINGS="android/settings.gradle"
+          if ! grep -q "playlyna-player" "$SETTINGS"; then
+            printf "\ninclude ':playlyna-player'\n" >> "$SETTINGS"
+          fi
+
+      - name: Add Kotlin plugin to root build.gradle
+        run: |
+          ROOT="android/build.gradle"
+          if ! grep -q "org.jetbrains.kotlin" "$ROOT"; then
+            sed -i "s#classpath 'com.android.tools.build:gradle#classpath 'org.jetbrains.kotlin:kotlin-gradle-plugin:2.0.21'\n        classpath 'com.android.tools.build:gradle#" "$ROOT"
+          fi
+
+      - name: Add dependency to app build.gradle
+        run: |
+          GRADLE="android/app/build.gradle"
+          if ! grep -q "playlyna-player" "$GRADLE"; then
+            sed -i "s#implementation project(':capacitor-android')#implementation project(':capacitor-android')\n    implementation project(':playlyna-player')#" "$GRADLE"
+          fi
+
+      - name: Edit MainActivity.java to register plugins
+        run: |
+          DEST="android/app/src/main/java/com/playlyna/top/MainActivity.java"
+          echo "=== ANTES ==="
+          cat "$DEST"
+          # Substitui a MainActivity.java pela versao que registra nossos plugins
+          cat > "$DEST" << 'JAVA_EOF'
+          package com.playlyna.top;
+
+          import android.os.Bundle;
+          import com.getcapacitor.BridgeActivity;
+          import com.playlyna.player.PlaylynaNativePlugin;
+          import com.playlyna.player.PlaylynaSharePlugin;
+          import com.playlyna.player.PlaylynaPlayerPlugin;
+
+          public class MainActivity extends BridgeActivity {
+              @Override
+              public void onCreate(Bundle savedInstanceState) {
+                  registerPlugin(PlaylynaNativePlugin.class);
+                  registerPlugin(PlaylynaSharePlugin.class);
+                  registerPlugin(PlaylynaPlayerPlugin.class);
+                  super.onCreate(savedInstanceState);
+              }
+          }
+          JAVA_EOF
+          echo "=== DEPOIS ==="
+          cat "$DEST"
+
+      - name: Write AndroidManifest.xml
+        run: |
+          cat > android/app/src/main/AndroidManifest.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
+              <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+              <uses-permission android:name="android.permission.WAKE_LOCK" />
+              <application
+                  android:allowBackup="true"
+                  android:icon="@mipmap/ic_launcher"
+                  android:label="@string/app_name"
+                  android:roundIcon="@mipmap/ic_launcher_round"
+                  android:supportsRtl="true"
+                  android:theme="@style/AppTheme"
+                  android:usesCleartextTraffic="true">
+                  <activity
+                      android:name=".MainActivity"
+                      android:configChanges="orientation|keyboardHidden|keyboard|screenSize|locale|smallestScreenSize|screenLayout|uiMode"
+                      android:exported="true"
+                      android:label="@string/title_activity_main"
+                      android:launchMode="singleTask"
+                      android:theme="@style/AppTheme.NoActionBarLaunch">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service
+                      android:name="com.playlyna.player.PlaylynaPlayerService"
+                      android:exported="false"
+                      android:foregroundServiceType="mediaPlayback" />
+              </application>
+          </manifest>
+          EOF
+
+      - name: chmod gradlew
+        run: chmod +x android/gradlew
+
+      - name: Build APK
+        run: |
+          cd android
+          set +e
+          ./gradlew assembleDebug --no-daemon --console=plain > /tmp/gradle.log 2>&1
+          GRADLE_EXIT=$?
+          echo "###### INICIO LOG ######"
+          cat /tmp/gradle.log
+          echo "###### FIM LOG ######"
+          echo "Gradle exit code: $GRADLE_EXIT"
+          exit $GRADLE_EXIT
+
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: playlyna-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error

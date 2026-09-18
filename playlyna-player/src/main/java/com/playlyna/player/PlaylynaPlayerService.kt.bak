@@ -1,0 +1,375 @@
+package com.playlyna.player
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Service
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.os.Binder
+import android.os.Build
+import android.os.Handler
+import android.os.IBinder
+import android.os.Looper
+import android.support.v4.media.MediaMetadataCompat
+import android.support.v4.media.session.MediaSessionCompat
+import android.support.v4.media.session.PlaybackStateCompat
+import androidx.core.app.NotificationCompat
+import androidx.media.app.NotificationCompat.MediaStyle
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackException
+import androidx.media3.common.Player
+import java.util.Collections
+
+class PlaylynaPlayerService : Service() {
+
+    data class TrackInfo(
+        val id: String,
+        val title: String,
+        val artist: String,
+        val album: String,
+        val uri: String,
+        val durationMs: Long
+    )
+
+    private val binder = LocalBinder()
+    private var player: ExoPlayer? = null
+    private lateinit var mediaSession: MediaSessionCompat
+    private val handler = Handler(Looper.getMainLooper())
+    private val queue: MutableList<TrackInfo> = mutableListOf()
+    private var currentIndex = -1
+    private var lastSeekAt = 0L
+    private var isSeeking = false
+    private var shuffle = false
+    private var repeatMode = "off"
+    private val shuffleOrder = mutableListOf<Int>()
+    private var listener: ((String, Map<String, Any>?) -> Unit)? = null
+
+    inner class LocalBinder : Binder() {
+        fun getService(): PlaylynaPlayerService = this@PlaylynaPlayerService
+    }
+
+    override fun onBind(intent: Intent?): IBinder = binder
+
+    override fun onCreate() {
+        super.onCreate()
+        createChannel()
+        handler.post {
+            try {
+                player = ExoPlayer.Builder(this).build()
+                try {
+                    val attrs = androidx.media3.common.AudioAttributes.Builder()
+                        .setUsage(androidx.media3.common.C.USAGE_MEDIA)
+                        .setContentType(androidx.media3.common.C.AUDIO_CONTENT_TYPE_MUSIC)
+                        .build()
+                    player?.setAudioAttributes(attrs, true)
+                } catch (e: Exception) {}
+                mediaSession = MediaSessionCompat(this, "PlaylynaSession")
+                mediaSession.setCallback(object : MediaSessionCompat.Callback() {
+                    override fun onPlay() = play()
+                    override fun onPause() = pause()
+                    override fun onSkipToNext() = next()
+                    override fun onSkipToPrevious() = prev()
+                    override fun onSeekTo(pos: Long) = seekTo(pos)
+                })
+                mediaSession.isActive = true
+                player?.addListener(object : Player.Listener {
+                    override fun onIsPlayingChanged(isPlaying: Boolean) {
+                        updatePlaybackState()
+                        emit("playpause", mapOf("isPlaying" to isPlaying))
+                    }
+                    override fun onMediaItemTransition(item: MediaItem?, reason: Int) {
+                        updateMetadata()
+                        emit("trackchange", currentTrackMap())
+                    }
+                    override fun onPlaybackStateChanged(state: Int) {
+                        if (state == Player.STATE_ENDED) handleEnded()
+                    }
+                    override fun onPlayerError(error: PlaybackException) {
+                        emit("error", mapOf("message" to (error.message ?: "erro")))
+                    }
+                })
+            } catch (e: Exception) {
+                emit("error", mapOf("message" to ("init: " + (e.message ?: ""))))
+            }
+        }
+        startTicker()
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        handler.post { try { startFg() } catch (_: Exception) {} }
+        return START_STICKY
+    }
+
+    fun setListener(l: (String, Map<String, Any>?) -> Unit) { listener = l }
+    private fun emit(event: String, data: Map<String, Any>?) { handler.post { listener?.invoke(event, data) } }
+
+    fun setQueue(tracks: List<TrackInfo>, startIndex: Int) {
+        handler.post {
+            queue.clear(); queue.addAll(tracks)
+            currentIndex = startIndex.coerceIn(0, (queue.size - 1).coerceAtLeast(0))
+            rebuildShuffle()
+            loadCurrent()
+        }
+    }
+    private fun rebuildShuffle() {
+        shuffleOrder.clear()
+        val idx = queue.indices.toMutableList()
+        Collections.shuffle(idx)
+        shuffleOrder.addAll(idx)
+    }
+    
+    fun play() {
+        handler.post {
+            try {
+                player?.play()
+                startFg()
+                updatePlaybackState()
+            } catch (_: Exception) {}
+        }
+    }
+
+    fun pause() {
+        handler.post {
+            try {
+                player?.pause()
+                updatePlaybackState()
+            } catch (_: Exception) {}
+        }
+    }
+
+    fun toggle() {
+        handler.post {
+            try {
+                val isP = player?.isPlaying ?: false
+                if (isP) {
+                    player?.pause()
+                } else {
+                    player?.play()
+                    startFg()
+                }
+                updatePlaybackState()
+            } catch (_: Exception) {}
+        }
+    }
+
+    fun next() {
+        handler.post {
+            val i = nextIdx(1)
+            if (i < 0) {
+                try { player?.pause() } catch (_: Exception) {}
+                return@post
+            }
+            currentIndex = i
+            loadCurrent()
+        }
+    }
+
+    fun prev() {
+        handler.post {
+            try {
+                if ((player?.currentPosition ?: 0L) > 3000L) {
+                    player?.seekTo(0L)
+                    updatePlaybackState()
+                    return@post
+                }
+                val i = nextIdx(-1)
+                if (i < 0) {
+                    player?.seekTo(0L)
+                    updatePlaybackState()
+                    return@post
+                }
+                currentIndex = i
+                loadCurrent()
+            } catch (_: Exception) {}
+        }
+    }
+
+    private fun nextIdx(step: Int): Int {
+        if (queue.isEmpty()) return -1
+        val order = if (shuffle) shuffleOrder else queue.indices.toList()
+        val cur = order.indexOf(currentIndex).let { if (it < 0) 0 else it }
+        var np = cur + step
+        if (np < 0) { if (repeatMode == "all") np = order.size - 1 else return -1 }
+        if (np >= order.size) { if (repeatMode == "all") np = 0 else return -1 }
+        return order[np]
+    }
+
+    private fun loadCurrent() {
+        if (currentIndex !in queue.indices) return
+        val t = queue[currentIndex]
+        try {
+            player?.setMediaItem(MediaItem.fromUri(Uri.parse(t.uri)))
+            player?.prepare()
+            player?.play()
+            startFg()
+            updateMetadata()
+            updatePlaybackState()
+        } catch (e: Exception) {
+            emit("error", mapOf("message" to (e.message ?: "erro")))
+        }
+    }
+
+    private fun handleEnded() {
+        if (repeatMode == "one") {
+            try {
+                player?.seekTo(0L)
+                player?.play()
+            } catch (_: Exception) {}
+            return
+        }
+        next()
+    }
+
+    fun seekTo(ms: Long) {
+        handler.post {
+            try {
+                isSeeking = true
+                lastSeekAt = System.currentTimeMillis()
+                val p = player ?: return@post
+                val wasPlaying = p.isPlaying
+
+                // Executa o seek de forma limpa preservando o estado anterior
+                p.seekTo(ms)
+                if (!wasPlaying) {
+                    p.pause()
+                } else {
+                    p.play()
+                }
+                updatePlaybackState()
+                
+                emit("progress", mapOf<String, Any>(
+                    "positionMs" to p.currentPosition,
+                    "durationMs" to p.duration.coerceAtLeast(0L)
+                ))
+
+                // Libera a trava de seek com segurança após o buffer estabilizar
+                handler.postDelayed({
+                    isSeeking = false
+                }, 400)
+            } catch (e: Exception) {
+                isSeeking = false
+                emit("error", mapOf("message" to ("seek: " + (e.message ?: ""))))
+            }
+        }
+    }
+
+    fun setShuffle(on: Boolean) { handler.post { shuffle = on; rebuildShuffle() } }
+    fun setRepeatMode(m: String) { handler.post { repeatMode = m } }
+    fun isPlaying(): Boolean = try { player?.isPlaying ?: false } catch (_: Exception) { false }
+    fun getPosition(): Long = try { player?.currentPosition ?: 0L } catch (_: Exception) { 0L }
+    fun getDuration(): Long = try { (player?.duration ?: 0L).coerceAtLeast(0L) } catch (_: Exception) { 0L }
+    fun getCurrentIndex(): Int = currentIndex
+
+    private fun currentTrackMap(): Map<String, Any>? {
+        if (currentIndex !in queue.indices) return null
+        val t = queue[currentIndex]
+        return mapOf(
+            "id" to t.id, "title" to t.title, "artist" to t.artist,
+            "album" to t.album, "index" to currentIndex,
+            "durationMs" to getDuration()
+        )
+    }
+
+    private fun createChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val ch = NotificationChannel(CHANNEL_ID, "Reproducao", NotificationManager.IMPORTANCE_LOW)
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            nm.createNotificationChannel(ch)
+        }
+    }
+
+    private fun buildNotif(): Notification {
+        val t = if (currentIndex in queue.indices) queue[currentIndex] else null
+        val openPi = PendingIntent.getActivity(this, 0,
+            packageManager.getLaunchIntentForPackage(packageName),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+        val playing = isPlaying()
+        val playIcon = if (playing) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_play
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.ic_media_play)
+            .setContentTitle(t?.title ?: "Playlyna")
+            .setContentText(t?.artist ?: "")
+            .setContentIntent(openPi)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setOnlyAlertOnce(true)
+            .setOngoing(playing)
+            .addAction(android.R.drawable.ic_media_previous, "Anterior", null)
+            .addAction(playIcon, "Play/Pause", null)
+            .addAction(android.R.drawable.ic_media_next, "Proxima", null)
+            .setStyle(MediaStyle().setMediaSession(mediaSession.sessionToken).setShowActionsInCompactView(0, 1, 2))
+            .build()
+    }
+
+    private fun startFg() {
+        val n = buildNotif()
+        if (Build.VERSION.SDK_INT >= 29) {
+            startForeground(NOTIF_ID, n, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
+        } else {
+            startForeground(NOTIF_ID, n)
+        }
+    }
+
+    private fun updateMetadata() {
+        val t = if (currentIndex in queue.indices) queue[currentIndex] else null
+        val md = MediaMetadataCompat.Builder()
+            .putString(MediaMetadataCompat.METADATA_KEY_TITLE, t?.title ?: "")
+            .putString(MediaMetadataCompat.METADATA_KEY_ARTIST, t?.artist ?: "")
+            .putString(MediaMetadataCompat.METADATA_KEY_ALBUM, t?.album ?: "")
+            .putLong(MediaMetadataCompat.METADATA_KEY_DURATION, getDuration())
+            .build()
+        mediaSession.setMetadata(md)
+    }
+
+    private fun updatePlaybackState() {
+        val playing = isPlaying()
+        val st = if (playing) PlaybackStateCompat.STATE_PLAYING else PlaybackStateCompat.STATE_PAUSED
+        val ps = PlaybackStateCompat.Builder()
+            .setActions(
+                PlaybackStateCompat.ACTION_PLAY or PlaybackStateCompat.ACTION_PAUSE or
+                PlaybackStateCompat.ACTION_PLAY_PAUSE or PlaybackStateCompat.ACTION_SKIP_TO_NEXT or
+                PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS or PlaybackStateCompat.ACTION_SEEK_TO
+            )
+            .setState(st, getPosition(), 1f)
+            .build()
+        mediaSession.setPlaybackState(ps)
+        try {
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            nm.notify(NOTIF_ID, buildNotif())
+        } catch (_: Exception) {}
+    }
+
+    private fun startTicker() {
+        handler.postDelayed(object : Runnable {
+            override fun run() {
+                try {
+                    val sinceSeek = System.currentTimeMillis() - lastSeekAt
+                    if (!isSeeking && sinceSeek > 1200 && isPlaying()) {
+                        val p = player
+                        if (p != null) {
+                            emit("progress", mapOf<String, Any>(
+                                "positionMs" to p.currentPosition,
+                                "durationMs" to p.duration.coerceAtLeast(0L)
+                            ))
+                        }
+                    }
+                } catch (_: Exception) {}
+                handler.postDelayed(this, 1000)
+            }
+        }, 1000)
+    }
+
+    override fun onDestroy() {
+        try { player?.release() } catch (_: Exception) {}
+        try { mediaSession.release() } catch (_: Exception) {}
+        super.onDestroy()
+    }
+
+    companion object {
+        const val CHANNEL_ID = "playlyna_playback"
+        const val NOTIF_ID = 4242
+    }
+}
